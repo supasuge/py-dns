@@ -93,7 +93,7 @@ uv run py-dns serve --host 127.0.0.1 --port 5353
 ```
 
 > Note:
-> Running a local resolver isn't necessary nor required, it very simply just ensure's your DNS are encrypted via DoH/DoT (DNS over HTTPS takes precedence, if not available falls back to DNS over TLS).
+> Running a local resolver isn't necessary nor required, it very simply just ensure's your DNS queries are encrypted via DoH/DoT (DNS over HTTPS takes precedence, if not available falls back to DNS over TLS).
 
 Query it:
 
