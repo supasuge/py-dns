@@ -3,6 +3,7 @@ name = "py-dns"
 version = "0.1.0"
 description = "Educational DNS security tool — deliberately vulnerable forwarder vs. hardened secure resolver"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.13"
 dependencies = [
     "dnspython>=2.8.0",

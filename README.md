@@ -62,6 +62,49 @@ uv run py-dns list-vulns
 
 `dig` is an alias for `inspect` essentially but slightly easier to use.
 
+By default, `inspect` runs the broad reconnaissance profile: DNS records, HTTPS metadata, passive OSINT references, certificate transparency, wildcard DNS validation, AXFR attempts, bounded subdomain brute forcing, CDN/provider detection, and origin-candidate validation. Use `--no-http`, `--no-osint`, `--no-active`, or `--no-bruteforce-subdomains` to reduce scan scope.
+
+## GitHub Pages Web Interface
+
+A static browser interface is available in `docs/` for GitHub Pages:
+
+```text
+docs/index.html
+docs/styles.css
+docs/app.js
+```
+
+It uses browser-side DNS-over-HTTPS lookups against `dns.google`, so it can run from GitHub Pages without a Python server. The page performs harmless DNS reads for address, NS, SOA, MX, TXT, CAA, DNSSEC, DMARC, MTA-STS, TLS-RPT, BIMI, wildcard-DNS posture, CDN detection, and common origin-candidate labels. It also prints CLI validation commands for deeper checks that require Python, local DNS tooling, passive OSINT, provider detection, certificate transparency, AXFR attempts, provider-aware origin-candidate validation, and bounded subdomain brute forcing.
+
+Preview locally:
+
+```bash
+python -m http.server 8080 --directory docs
+```
+
+Then open `http://127.0.0.1:8080`.
+
+Publish with GitHub Pages:
+
+1. Commit and push the `docs/` directory.
+2. In GitHub, open the repository settings.
+3. Go to **Pages**.
+4. Set **Source** to **Deploy from a branch**.
+5. Select the branch that contains the site and choose the `/docs` folder.
+6. Save the settings and wait for GitHub to publish the Pages URL.
+
+Makefile helpers:
+
+```bash
+make sync
+make install
+make uninstall
+make inspect DOMAIN=example.com
+make inspect-light DOMAIN=example.com
+make web PORT=8080
+make check
+```
+
 ## Secure Resolver
 
 The resolver path is implemented by `SecureResolver` and `SecureUDPServer`.
@@ -126,15 +169,16 @@ The main scan does these steps:
 1. Normalizes the domain by stripping a trailing dot and lowercasing it.
 2. Queries the default DNS record set through DoH.
 3. Queries extra mail/security records through DoH.
-4. Optionally probes HTTPS headers with a `HEAD` request.
+4. Optionally probes HTTPS metadata, headers, CSP, title, and TLS certificate SANs.
 5. Detects providers and hosted services from DNS suffixes, IP ranges, and HTTP headers.
 6. Optionally collects passive OSINT and certificate transparency names.
 7. Optionally performs low-volume active DNS checks and AXFR attempts.
-8. If Cloudflare is detected, resolves passive origin-exposure candidate hostnames.
+8. If a CDN/edge provider is detected, resolves provider-aware origin-exposure candidate hostnames.
 9. Classifies mail hosting context.
-10. Generates findings with severity, evidence, impact, remediation, and validation steps.
-11. Optionally performs bounded subdomain brute forcing and scans each selected subdomain separately.
-12. Optionally sends the structured inspection payload to GPT-5.5 for an actionable remediation plan.
+10. Runs harmless DNS posture validation, including wildcard-DNS probes with a deterministic random-looking hostname.
+11. Generates findings with severity, evidence, impact, remediation, and validation steps.
+12. Optionally performs bounded subdomain brute forcing and scans each selected subdomain separately.
+13. Optionally sends the structured inspection payload to GPT-5.5 for an actionable remediation plan.
 
 Default DoH record types:
 
@@ -158,8 +202,22 @@ DOMAIN NS
 DOMAIN SOA
 DOMAIN TXT filtered for SPF
 _dmarc.DOMAIN TXT filtered for DMARC
+py-dns-validation-*.DOMAIN A/AAAA wildcard checks
 AXFR attempts against authoritative nameserver A addresses
 ```
+
+Expanded posture checks include:
+
+- public DNS returning private, loopback, link-local, multicast, or other special-use addresses;
+- single authoritative nameserver and same-suffix nameserver concentration;
+- SOA timer issues, including short expire, long negative-cache minimum, and retry values not below refresh;
+- very low or very high TTLs on common externally visible records;
+- missing CAA, missing `issuewild`, and unusual CAA `iodef` destinations;
+- missing, multiple, permissive, neutral, lookup-heavy, or deprecated SPF mechanisms;
+- missing, duplicate, monitor-only, partial, and no-reporting DMARC policies;
+- missing or malformed MTA-STS, TLS-RPT, and BIMI records;
+- wildcard DNS that resolves a validation hostname;
+- manual-verification hints for dangling provider CNAMEs, public AXFR, and potential CDN origin exposure.
 
 Passive OSINT collection:
 
@@ -263,25 +321,93 @@ Important behavior:
 - External mail providers, such as Proton Mail, are reported as DNS/mail-provider configuration context, not web-server or Linode VPS findings.
 - MTA-STS findings are lowered to `low` when mail is delegated to a recognized external provider.
 
-## Cloudflare And Origin Exposure
+## CDN And Origin Exposure
 
-When Cloudflare is detected, the tool tries passive origin-exposure discovery by resolving candidate hostnames such as:
+When a CDN or edge provider is detected, the tool tries provider-aware origin-exposure discovery by resolving candidate hostnames such as:
 
 ```text
 origin.DOMAIN
+origin-www.DOMAIN
 direct.DOMAIN
 backend.DOMAIN
 server.DOMAIN
+web.DOMAIN
+lb.DOMAIN
+elb.DOMAIN
 app.DOMAIN
 api.DOMAIN
 staging.DOMAIN
 stage.DOMAIN
 dev.DOMAIN
+old.DOMAIN
+legacy.DOMAIN
+internal.DOMAIN
 ```
 
-It also considers gathered certificate transparency names whose first label matches those patterns.
+It also considers gathered certificate transparency names whose first label matches origin-like patterns and adds `origin.`/`direct.` variants for selected CT names.
 
-The tool only reports these as passive origin-exposure candidates when A or AAAA records resolve outside published Cloudflare ranges. This is not proof of an origin IP. The finding explicitly requires owner validation before firewall, DNS, or application changes.
+The tool reports origin-exposure candidates when A or AAAA records resolve outside known edge ranges for providers it can classify. For Cloudflare, published IPv4/IPv6 ranges are used to suppress normal proxied edge addresses. For other providers, hostname/provider evidence and candidate DNS resolution are reported with lower confidence unless HTTPS metadata also looks similar.
+
+When HTTPS probing is enabled, the scanner sends bounded HTTPS requests to candidate hostnames and compares status/header metadata with the protected hostname. It also collects CSP/reporting headers, HTML titles, and TLS certificate SAN metadata for additional authorized pivots. It does not brute force HTTP paths, exploit services, or prove bypass. Treat every candidate as an owner-validation item and confirm with asset inventory, application logs, and approved direct-origin testing before firewall, DNS, or application changes.
+
+```text
+                         normal protected request path
+
+  browser / client
+        |
+        | 1. DNS lookup for www.example.com
+        v
+  public DNS returns CDN edge address
+        |
+        | 2. HTTPS request
+        v
+  +-------------------+       3. cache miss / dynamic request       +----------------------+
+  | CDN / edge proxy  | ------------------------------------------> | origin web server    |
+  | Cloudflare/Fastly |                                             | real hosting IP      |
+  | CloudFront/Akamai | <------------------------------------------ | app/API/backend      |
+  +-------------------+       4. response cached/proxied            +----------------------+
+        |
+        v
+  client sees CDN IPs, CDN TLS, CDN WAF/rate-limit behavior
+
+
+                         defensive origin-exposure checks
+
+  py-dns inspect DOMAIN
+        |
+        +--> current DNS: A/AAAA/CNAME/MX/TXT/CAA/NS/SOA/HTTPS
+        +--> passive pivots: CT names, search URLs, Censys, URLScan, Netcraft, VT
+        +--> origin labels: origin, direct, backend, server, web, lb, old, legacy...
+        +--> mail and side services: MX hosts, TXT metadata, CSP hostnames
+        +--> TLS certificate SANs and certificate reuse pivots
+        +--> CSP/report-uri/report-to IP or backend hostname leaks
+        +--> wildcard DNS and AXFR validation
+        |
+        v
+  candidate origin observations
+        |
+        +--> suppress known CDN edge ranges where available
+        +--> compare HTTPS status/header/title metadata
+        +--> report as candidate, not proof
+        |
+        v
+  defender validates with inventory, logs, firewall policy, and provider console
+```
+
+Origin recon methods implemented:
+
+- current A, AAAA, CNAME, MX, TXT, CAA, NS, SOA, HTTPS, DS, and DNSKEY lookups;
+- certificate transparency subdomain collection through `crt.sh`;
+- Censys, URLScan, Netcraft, VirusTotal, DNSDumpster, and search-engine reference pivots;
+- HTTP title pivots for Censys and URLScan;
+- TLS certificate SAN collection and certificate-name pivots;
+- CSP, CSP report-only, `report-to`, and `reporting-endpoints` parsing for raw IPs and internal hostnames;
+- provider-aware origin label resolution for common backend naming patterns;
+- CT-derived origin/direct variants;
+- MX and side-service review where non-CDN services may expose infrastructure;
+- wildcard DNS validation using deterministic random-looking labels;
+- AXFR attempts against authoritative nameservers;
+- HTTPS metadata comparison for candidate origin hostnames.
 
 ## Zone Transfer Checks
 
@@ -758,7 +884,6 @@ Planned improvements:
 - Add resolver concurrency for bounded subdomain scanning.
 - Add per-source timeout and retry configuration.
 - Add provider-specific guidance for Cloudflare, Linode/Akamai Cloud, Proton Mail, Google Workspace, and Microsoft 365.
-- Add a separate `LICENSE` file containing the MIT license.
 
 ## Security And Ethics
 
@@ -766,26 +891,8 @@ Use this tool only on domains and infrastructure you own or are authorized to as
 
 The tool performs network queries and HTTP requests. `--bruteforce-subdomains`, `--max-bruteforce`, and `--max-scanned-subdomains` can increase query volume. Keep limits appropriate for the target and authorization scope.
 
-Cloudflare origin candidates are passive DNS observations, not proof of bypass. Validate against asset inventory and logs before making changes.
+CDN origin candidates are DNS and HTTP metadata observations, not proof of bypass. Validate against asset inventory and logs before making changes.
 
-## MIT License
+## License
 
-Copyright (c) 2026 py-dns contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MIT. See `LICENSE.txt`.

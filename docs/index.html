@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>py-dns Web Inspector</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Browser DNS-over-HTTPS scanner</p>
+          <h1>py-dns</h1>
+          <p class="lede">
+            Run harmless DNS posture checks from GitHub Pages and export validation steps for the full CLI.
+          </p>
+          <form id="scan-form" class="scan-form">
+            <label for="domain">Domain</label>
+            <div class="input-row">
+              <input id="domain" name="domain" type="text" inputmode="url" placeholder="example.com" autocomplete="off" required />
+              <button type="submit">Scan</button>
+            </div>
+          </form>
+        </div>
+        <div class="signal" aria-hidden="true">
+          <div class="ring ring-one"></div>
+          <div class="ring ring-two"></div>
+          <div class="beam"></div>
+          <div class="node node-a"></div>
+          <div class="node node-b"></div>
+          <div class="node node-c"></div>
+        </div>
+      </section>
+
+      <section class="workspace" aria-live="polite">
+        <aside class="summary">
+          <div>
+            <span class="label">Target</span>
+            <strong id="target">No scan yet</strong>
+          </div>
+          <div>
+            <span class="label">Records</span>
+            <strong id="record-count">0</strong>
+          </div>
+          <div>
+            <span class="label">Findings</span>
+            <strong id="finding-count">0</strong>
+          </div>
+          <div>
+            <span class="label">Status</span>
+            <strong id="status">Idle</strong>
+          </div>
+        </aside>
+
+        <section class="results">
+          <div class="section-head">
+            <h2>Findings</h2>
+            <button id="copy-report" type="button" disabled>Copy report</button>
+          </div>
+          <div id="findings" class="empty">Enter a domain to run DNS posture checks.</div>
+
+          <div class="section-head compact">
+            <h2>Origin Candidates</h2>
+          </div>
+          <div id="origins" class="records"></div>
+
+          <div class="section-head compact">
+            <h2>DNS Answers</h2>
+          </div>
+          <div id="records" class="records"></div>
+
+          <div class="section-head compact">
+            <h2>CLI Validation</h2>
+          </div>
+          <pre id="validation" class="validation">uv run py-dns inspect example.com --bruteforce-subdomains --plain</pre>
+        </section>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

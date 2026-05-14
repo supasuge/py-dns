@@ -93,7 +93,7 @@ def inspect(
     ai_model: Annotated[str, typer.Option(help="OpenAI model for --ai-report.")] = DEFAULT_MODEL,
     ai_slow: Annotated[bool, typer.Option("--ai-slow", help="Use automatic service tier and medium reasoning instead of fast mode.")] = False,
     output_file: Annotated[bool, typer.Option("--output", "-o", help="Write the complete plain-text report to report-MMDDHHmm-{domain}.txt.")] = False,
-    bruteforce_subdomains: Annotated[bool, typer.Option("--bruteforce-subdomains", "--bf", help="Resolve bounded subdomain guesses seeded by gathered domains, then scan each resolved host separately.")] = False,
+    bruteforce_subdomains: Annotated[bool, typer.Option("--bruteforce-subdomains/--no-bruteforce-subdomains", "--bf/--no-bf", help="Resolve bounded subdomain guesses seeded by gathered domains, then scan each resolved host separately.")] = True,
     subdomain_wordlist: Annotated[Path | None, typer.Option("--subdomain-wordlist", "-w", help="Optional newline-delimited subdomain label wordlist for --bruteforce-subdomains.")] = None,
     max_bruteforce: Annotated[int, typer.Option(help="Maximum brute-force candidates to resolve.")] = 200,
     max_scanned_subdomains: Annotated[int, typer.Option(help="Maximum gathered/bruteforced subdomains to scan separately.")] = 25,
@@ -283,7 +283,7 @@ def dig(
         ai_model=DEFAULT_MODEL,
         ai_slow=False,
         output_file=False,
-        bruteforce_subdomains=False,
+        bruteforce_subdomains=True,
         subdomain_wordlist=None,
         max_bruteforce=200,
         max_scanned_subdomains=25,
@@ -435,10 +435,22 @@ def _render_origin_candidates(inspection: Inspection) -> None:
     table = _table("Passive Origin Exposure Candidates", header_style="bold red")
     table.add_column("Hostname")
     table.add_column("Addresses", overflow="fold", max_width=_fold_width(3))
+    table.add_column("Provider")
     table.add_column("Confidence")
+    table.add_column("Validation")
     table.add_column("Evidence", overflow="fold", max_width=_fold_width(2, maximum=80))
     for candidate in inspection.origin_candidates:
-        table.add_row(candidate.hostname, ", ".join(candidate.addresses), candidate.confidence, candidate.evidence)
+        validation = candidate.validation_status
+        if candidate.validation_evidence:
+            validation = f"{validation}: {candidate.validation_evidence}"
+        table.add_row(
+            candidate.hostname,
+            ", ".join(candidate.addresses),
+            candidate.edge_provider or "-",
+            candidate.confidence,
+            validation,
+            candidate.evidence,
+        )
     console.print(table)
 
 

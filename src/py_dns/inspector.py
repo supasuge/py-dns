@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import re
+import socket
+import ssl
 from dataclasses import dataclass
+from html import unescape
 from ipaddress import ip_address, ip_network
 from urllib.parse import quote_plus
 
@@ -78,6 +82,37 @@ ORIGIN_CANDIDATE_PREFIXES = (
     "staging",
     "stage",
     "dev",
+)
+
+ORIGIN_DISCOVERY_PREFIXES = (
+    "origin",
+    "origin-www",
+    "direct",
+    "backend",
+    "server",
+    "app",
+    "api",
+    "web",
+    "www-origin",
+    "lb",
+    "elb",
+    "loadbalancer",
+    "prod",
+    "production",
+    "staging",
+    "stage",
+    "dev",
+    "test",
+    "old",
+    "legacy",
+    "internal",
+    "vpn",
+    "cpanel",
+    "whm",
+    "plesk",
+    "mail",
+    "ftp",
+    "ssh",
 )
 
 DEFAULT_BRUTEFORCE_LABELS = (
@@ -183,11 +218,40 @@ HTTP_HEADER_PROVIDERS = {
     "x-nf-request-id": "Netlify",
     "x-fastly-request-id": "Fastly",
     "x-akamai-transformed": "Akamai",
+    "x-akamai-request-id": "Akamai",
+    "x-iinfo": "Imperva",
+    "x-cdn": "CDN",
+    "cdn-requestid": "Bunny",
+    "x-gcore-request-id": "Gcore",
+    "x-cdn77-cache": "CDN77",
     "x-cache": "AWS CloudFront/Akamai/Fastly",
     "x-amz-cf-id": "AWS CloudFront",
+    "x-amz-cf-pop": "AWS CloudFront",
     "x-azure-ref": "Azure",
+    "x-azure-fdid": "Azure",
     "x-served-by": "Fastly/Netlify",
     "server": "server-header",
+}
+
+EDGE_PROVIDERS = {
+    "Akamai",
+    "AWS CloudFront",
+    "Azure",
+    "Bunny",
+    "CDN",
+    "CDN77",
+    "CDNetworks",
+    "Cloudflare",
+    "Cloudflare for SaaS",
+    "Edgio/Limelight",
+    "Fastly",
+    "Gcore",
+    "Google Cloud",
+    "Imperva",
+    "KeyCDN",
+    "Netlify",
+    "StackPath",
+    "Vercel",
 }
 
 CLOUDFLARE_NETWORKS = tuple(
@@ -244,6 +308,7 @@ class HttpProbe:
     status_code: int | None
     headers: tuple[tuple[str, str], ...]
     error: str | None = None
+    title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -263,6 +328,9 @@ class OriginCandidate:
     source: str
     confidence: str
     evidence: str
+    edge_provider: str | None = None
+    validation_status: str = "not-tested"
+    validation_evidence: str = ""
 
 
 @dataclass(frozen=True)
@@ -319,8 +387,17 @@ def inspect_domain(
         detections = detect_services(results + security_results, probe)
         osint_records, subdomains = collect_passive_osint(domain, max_subdomains=max_subdomains) if passive_osint else ((), ())
         active_records = collect_active_dns_records(domain) if active_checks else ()
+        origin_intel_records = collect_origin_intelligence(domain, probe) if active_checks else ()
         zone_transfer_records = attempt_zone_transfers(domain) if active_checks else ()
-        origin_candidates = find_origin_candidates(domain, subdomains, doh) if any(d.provider == "Cloudflare" for d in detections) else ()
+        origin_candidates = find_origin_candidates(
+            domain,
+            subdomains,
+            doh,
+            detections=detections,
+            protected_probe=probe,
+            recon_records=origin_intel_records,
+            validate_http=http_probe,
+        ) if _edge_providers(detections) else ()
         mail_profile = classify_mail_profile(results, security_results, detections)
         findings = analyze_security(
             domain,
@@ -328,6 +405,7 @@ def inspect_domain(
             security_results,
             detections,
             mail_profile=mail_profile,
+            active_dns_records=active_records,
             zone_transfer_records=zone_transfer_records,
             origin_candidates=origin_candidates,
         )
@@ -338,7 +416,7 @@ def inspect_domain(
             detections,
             findings,
             probe,
-            osint_records + active_records,
+            osint_records + active_records + origin_intel_records,
             subdomains,
             zone_transfer_records,
             origin_candidates,
@@ -370,6 +448,7 @@ def analyze_security(
     detections: tuple[Detection, ...],
     *,
     mail_profile: MailProfile | None = None,
+    active_dns_records: tuple[ReconRecord, ...] = (),
     zone_transfer_records: tuple[ReconRecord, ...] = (),
     origin_candidates: tuple[OriginCandidate, ...] = (),
 ) -> tuple[Finding, ...]:
@@ -403,6 +482,11 @@ def analyze_security(
             )
         )
 
+    findings.extend(_address_posture_findings(domain, answers.get("A", ()) + answers.get("AAAA", ())))
+    findings.extend(_nameserver_posture_findings(domain, answers.get("NS", ())))
+    findings.extend(_soa_posture_findings(domain, answers.get("SOA", ())))
+    findings.extend(_ttl_posture_findings(domain, results))
+
     if not answers.get("CAA"):
         findings.append(
             _finding(
@@ -415,6 +499,8 @@ def analyze_security(
                 f"dig CAA {domain} +short should show only approved issuers such as issue/issuewild entries.",
             )
         )
+    else:
+        findings.extend(_caa_posture_findings(domain, answers.get("CAA", ())))
 
     if not answers.get("DS") and not answers.get("DNSKEY"):
         findings.append(
@@ -475,6 +561,7 @@ def analyze_security(
                 f"dig TXT {domain} +short | grep -i 'v=spf1' should print exactly one line.",
             )
         )
+    findings.extend(_spf_posture_findings(domain, tuple(spf)))
     if any("+all" in value.lower() for value in spf):
         findings.append(
             _finding(
@@ -516,6 +603,18 @@ def analyze_security(
             )
         )
     elif dmarc and (mail_profile.receives_mail or mail_profile.sends_mail):
+        if len(dmarc) > 1:
+            findings.append(
+                _finding(
+                    "high",
+                    "DMARC",
+                    "multiple",
+                    f"{len(dmarc)} DMARC TXT records found",
+                    "Multiple DMARC records cause receivers to ignore or error on the policy.",
+                    "Publish exactly one TXT record at _dmarc with all intended DMARC tags.",
+                    f"dig TXT _dmarc.{domain} +short should print exactly one v=DMARC1 record.",
+                )
+            )
         dmarc_text = " ".join(dmarc).lower()
         if "p=none" in dmarc_text:
             findings.append(
@@ -530,6 +629,31 @@ def analyze_security(
                         "Move to p=quarantine or p=reject after confirming legitimate mail alignment.",
                     ),
                     f"dig TXT _dmarc.{domain} +short should show p=quarantine or p=reject.",
+                )
+            )
+        if "sp=none" in dmarc_text:
+            findings.append(
+                _finding(
+                    "low",
+                    "DMARC",
+                    "subdomains monitor-only",
+                    dmarc[0],
+                    "Subdomain mail spoofing can remain in monitoring mode even if the organizational domain is stricter.",
+                    "Set sp=quarantine or sp=reject if subdomains should inherit enforcement.",
+                    f"dig TXT _dmarc.{domain} +short should show an intentional sp= policy.",
+                )
+            )
+        pct_value = _dmarc_pct(dmarc_text)
+        if pct_value is not None and pct_value < 100:
+            findings.append(
+                _finding(
+                    "low",
+                    "DMARC",
+                    "partial enforcement",
+                    dmarc[0],
+                    "Only a portion of failing messages are requested for enforcement.",
+                    "Move pct to 100 after monitoring confirms legitimate mail alignment.",
+                    f"dig TXT _dmarc.{domain} +short should show pct=100 or omit pct once rollout is complete.",
                 )
             )
         if "rua=" not in dmarc_text:
@@ -547,8 +671,22 @@ def analyze_security(
                     f"dig TXT _dmarc.{domain} +short should include a rua= reporting URI.",
                 )
             )
+        if "ruf=" in dmarc_text:
+            findings.append(
+                _finding(
+                    "info",
+                    "DMARC forensic reports",
+                    "enabled",
+                    dmarc[0],
+                    "Forensic reports can contain message samples or personal data depending on receiver behavior.",
+                    "Confirm ruf destinations are monitored and approved for potentially sensitive report contents.",
+                    f"dig TXT _dmarc.{domain} +short should only include ruf= if forensic reporting is intentional.",
+                )
+            )
 
-    if mail_profile.receives_mail and not _txt_values(security.get("MTA-STS")):
+    mta_sts = _txt_values(security.get("MTA-STS"))
+    tls_rpt = _txt_values(security.get("TLS-RPT"))
+    if mail_profile.receives_mail and not mta_sts:
         severity = "low" if mail_profile.management == "external-mail-provider" else "medium"
         findings.append(
             _finding(
@@ -564,7 +702,19 @@ def analyze_security(
                 f"dig TXT _mta-sts.{domain} +short should return v=STSv1, and https://mta-sts.{domain}/.well-known/mta-sts.txt should be valid.",
             )
         )
-    if mail_profile.receives_mail and not _txt_values(security.get("TLS-RPT")):
+    elif mail_profile.receives_mail and not any(_clean_txt(value).lower().startswith("v=stsv1") for value in mta_sts):
+        findings.append(
+            _finding(
+                "medium",
+                "MTA-STS",
+                "invalid marker",
+                mta_sts[0],
+                "Senders may ignore MTA-STS when the DNS policy marker is malformed.",
+                "Publish a TXT record beginning with v=STSv1 at _mta-sts.",
+                f"dig TXT _mta-sts.{domain} +short should begin with v=STSv1.",
+            )
+        )
+    if mail_profile.receives_mail and not tls_rpt:
         findings.append(
             _finding(
                 "low",
@@ -579,8 +729,34 @@ def analyze_security(
                 f"dig TXT _smtp._tls.{domain} +short should return v=TLSRPTv1 with rua=mailto: or rua=https:.",
             )
         )
+    elif mail_profile.receives_mail:
+        tls_rpt_text = " ".join(_clean_txt(value).lower() for value in tls_rpt)
+        if "v=tlsrptv1" not in tls_rpt_text or "rua=" not in tls_rpt_text:
+            findings.append(
+                _finding(
+                    "low",
+                    "TLS-RPT",
+                    "incomplete",
+                    tls_rpt[0],
+                    "SMTP TLS failure reports may not be delivered or recognized.",
+                    "Publish TLS-RPT with v=TLSRPTv1 and a monitored rua destination.",
+                    f"dig TXT _smtp._tls.{domain} +short should include v=TLSRPTv1 and rua=.",
+                )
+            )
 
     bimi = _txt_values(security.get("BIMI"))
+    if bimi and not any(_clean_txt(value).lower().startswith("v=bimi1") for value in bimi):
+        findings.append(
+            _finding(
+                "low",
+                "BIMI",
+                "invalid marker",
+                bimi[0],
+                "Mailbox providers may ignore malformed BIMI records.",
+                "Publish BIMI TXT records beginning with v=BIMI1 only after DMARC enforcement is ready.",
+                f"dig TXT default._bimi.{domain} +short should begin with v=BIMI1 when BIMI is used.",
+            )
+        )
     if bimi and (not dmarc or "p=none" in " ".join(dmarc).lower()):
         findings.append(
             _finding(
@@ -624,6 +800,24 @@ def analyze_security(
             )
         )
 
+    wildcard_records = tuple(
+        record
+        for record in active_dns_records
+        if record.category == "wildcard-dns" and record.status == "resolved"
+    )
+    if wildcard_records:
+        findings.append(
+            _finding(
+                "medium",
+                "Wildcard DNS",
+                "enabled",
+                "; ".join(f"{record.name} -> {record.value}" for record in wildcard_records[:3]),
+                "Wildcard DNS can mask typos, make asset inventory noisy, and route unexpected hostnames to production services.",
+                "Confirm the wildcard is intentional and that the destination safely handles unknown hostnames.",
+                f"dig A definitely-not-a-real-hostname-validate.{domain} +short should return no answer unless wildcard DNS is explicitly required.",
+            )
+        )
+
     if zone_transfer_records:
         nameservers = sorted({record.source.removeprefix("AXFR ") for record in zone_transfer_records})
         findings.append(
@@ -640,15 +834,18 @@ def analyze_security(
 
     if origin_candidates:
         hostnames = ", ".join(candidate.hostname for candidate in origin_candidates[:5])
+        edge_provider_text = ", ".join(
+            sorted({candidate.edge_provider or "edge provider" for candidate in origin_candidates})
+        )
         findings.append(
             _finding(
                 "medium",
                 "Origin exposure",
                 "possible",
-                f"Potential non-Cloudflare endpoints: {hostnames}",
+                f"Potential non-edge endpoints for {edge_provider_text}: {hostnames}",
                 "If any candidate is a true web origin, direct access may bypass edge protections, WAF policy, rate limiting, and logging assumptions.",
                 "Verify ownership of each candidate, restrict origin ingress to trusted edge/provider ranges where applicable, and remove stale direct DNS records.",
-                "Confirm each candidate with asset inventory and application logs before changing firewall policy; DNS evidence alone is not proof of origin.",
+                "Confirm each candidate with asset inventory, application logs, and approved direct-origin testing before changing firewall policy; DNS/HTTP metadata alone is not proof of origin.",
             )
         )
 
@@ -715,6 +912,69 @@ def collect_active_dns_records(domain: str, timeout: float = 3.0) -> tuple[Recon
             if category == "nslookup-dmarc" and "v=dmarc1" not in value.lower():
                 continue
             records.append(ReconRecord("system-resolver", category, name, value))
+    wildcard_seed = sum((index + 1) * ord(char) for index, char in enumerate(domain)) % 10_000_000
+    wildcard_label = f"py-dns-validation-{wildcard_seed}.{domain}"
+    for qtype in ("A", "AAAA"):
+        try:
+            answers = resolver.resolve(wildcard_label, qtype, raise_on_no_answer=False)
+        except (dns.exception.DNSException, OSError):
+            continue
+        if not answers.rrset:
+            continue
+        values = tuple(answer.to_text().strip() for answer in answers)
+        if values:
+            records.append(
+                ReconRecord(
+                    "system-resolver",
+                    "wildcard-dns",
+                    wildcard_label,
+                    ", ".join(values),
+                    "resolved",
+                    f"Random validation hostname returned {qtype} answers.",
+                )
+            )
+    return tuple(records)
+
+
+def collect_origin_intelligence(domain: str, probe: HttpProbe | None) -> tuple[ReconRecord, ...]:
+    records: list[ReconRecord] = []
+    if probe is not None:
+        if probe.title:
+            encoded_title = quote_plus(probe.title)
+            records.extend(
+                (
+                    ReconRecord(
+                        "Censys",
+                        "http-title-pivot",
+                        domain,
+                        f'https://search.censys.io/search?resource=hosts&q=services.http.response.html_title%3A"{encoded_title}"',
+                        "reference",
+                        "Manual pivot for hosts with the same HTTP title.",
+                    ),
+                    ReconRecord(
+                        "URLScan",
+                        "http-title-pivot",
+                        domain,
+                        f'https://urlscan.io/search/#{quote_plus(f"page.title:{probe.title}")}',
+                        "reference",
+                        "Manual pivot for indexed pages with the same title.",
+                    ),
+                )
+            )
+        records.extend(_csp_origin_records(domain, probe))
+    cert_records, cert_names = _tls_certificate_records(domain)
+    records.extend(cert_records)
+    for cert_name in cert_names:
+        records.append(
+            ReconRecord(
+                "Censys",
+                "certificate-name-pivot",
+                cert_name,
+                f"https://search.censys.io/search?resource=hosts&q={quote_plus(cert_name)}",
+                "reference",
+                "Manual certificate/SAN reuse pivot for authorized infrastructure review.",
+            )
+        )
     return tuple(records)
 
 
@@ -762,34 +1022,188 @@ def find_origin_candidates(
     domain: str,
     subdomains: tuple[str, ...],
     doh: DoHClient,
+    *,
+    detections: tuple[Detection, ...] = (),
+    protected_probe: HttpProbe | None = None,
+    recon_records: tuple[ReconRecord, ...] = (),
+    validate_http: bool = True,
 ) -> tuple[OriginCandidate, ...]:
-    names = {f"{prefix}.{domain}" for prefix in ORIGIN_CANDIDATE_PREFIXES}
-    for subdomain in subdomains:
-        first_label = subdomain.removesuffix(f".{domain}").split(".", 1)[0]
-        if first_label in ORIGIN_CANDIDATE_PREFIXES:
-            names.add(subdomain)
+    edge_providers = _edge_providers(detections) or ("edge-provider",)
+    names = _origin_candidate_names(domain, subdomains)
+    names.update(
+        record.name
+        for record in recon_records
+        if record.category == "csp-hostname" and record.name.endswith(f".{domain}")
+    )
 
     candidates: list[OriginCandidate] = []
-    for name in sorted(names)[:50]:
+    direct_candidates = _origin_candidates_from_recon(edge_providers, recon_records)
+    candidates.extend(direct_candidates)
+    for name in sorted(names)[:80]:
         addresses: list[str] = []
         for qtype in ("A", "AAAA"):
             result = doh.lookup(name, qtype)
             if result is None or result.status != 0:
                 continue
             for answer in result.answers:
-                if answer.type in {1, 28} and not _is_cloudflare_address(answer.data):
+                if answer.type in {1, 28} and not _is_known_edge_address(answer.data, edge_providers):
                     addresses.append(answer.data)
-        if addresses:
-            candidates.append(
-                OriginCandidate(
-                    name,
-                    tuple(sorted(set(addresses))),
-                    "passive-dns",
-                    "low",
-                    "Hostname pattern resolved outside published Cloudflare ranges; manual ownership validation required.",
-                )
+        if not addresses:
+            continue
+
+        validation_status = "not-tested"
+        validation_evidence = ""
+        if validate_http:
+            candidate_probe = probe_http(name)
+            validation_status, validation_evidence = _compare_origin_http_probe(
+                protected_probe,
+                candidate_probe,
             )
+
+        candidates.append(
+            OriginCandidate(
+                name,
+                tuple(sorted(set(addresses))),
+                _origin_candidate_source(name, domain, subdomains),
+                _origin_candidate_confidence(name, validation_status),
+                _origin_candidate_evidence(edge_providers, validation_status),
+                ", ".join(edge_providers),
+                validation_status,
+                validation_evidence,
+            )
+        )
     return tuple(candidates)
+
+
+def _edge_providers(detections: tuple[Detection, ...]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                detection.provider
+                for detection in detections
+                if detection.provider in EDGE_PROVIDERS
+                or any(provider in detection.provider for provider in EDGE_PROVIDERS)
+            }
+        )
+    )
+
+
+def _origin_candidates_from_recon(
+    edge_providers: tuple[str, ...],
+    records: tuple[ReconRecord, ...],
+) -> tuple[OriginCandidate, ...]:
+    candidates: list[OriginCandidate] = []
+    for record in records:
+        if record.category not in {"csp-ip-leak", "certificate-ip-san"}:
+            continue
+        values = tuple(
+            value.strip()
+            for value in re.split(r"[, ]+", record.value)
+            if value.strip() and _is_ip_address(value.strip())
+        )
+        if not values:
+            continue
+        candidates.append(
+            OriginCandidate(
+                record.name,
+                tuple(sorted(set(values))),
+                record.category,
+                "medium",
+                f"{record.category} exposed address material in {record.source}; owner validation required.",
+                ", ".join(edge_providers),
+                "metadata-leak",
+                record.evidence,
+            )
+        )
+    return tuple(candidates)
+
+
+def _origin_candidate_names(domain: str, subdomains: tuple[str, ...]) -> set[str]:
+    names = {f"{prefix}.{domain}" for prefix in ORIGIN_DISCOVERY_PREFIXES}
+    for subdomain in subdomains:
+        subdomain = subdomain.rstrip(".").lower()
+        if not subdomain.endswith(f".{domain}"):
+            continue
+        labels = subdomain.removesuffix(f".{domain}").split(".")
+        first_label = labels[0]
+        if first_label in ORIGIN_DISCOVERY_PREFIXES or any(
+            marker in first_label
+            for marker in ("origin", "direct", "backend", "server", "stage", "dev", "old")
+        ):
+            names.add(subdomain)
+        for prefix in ("origin", "direct"):
+            names.add(f"{prefix}.{subdomain}")
+    return names
+
+
+def _origin_candidate_source(name: str, domain: str, subdomains: tuple[str, ...]) -> str:
+    if name in subdomains:
+        return "certificate-transparency"
+    if name.endswith(f".{domain}"):
+        return "dns-label-heuristic"
+    return "passive-dns"
+
+
+def _origin_candidate_confidence(name: str, validation_status: str) -> str:
+    if validation_status == "http-similar":
+        return "medium"
+    if name.split(".", 1)[0] in {"origin", "direct", "backend", "www-origin"}:
+        return "low-medium"
+    return "low"
+
+
+def _origin_candidate_evidence(edge_providers: tuple[str, ...], validation_status: str) -> str:
+    provider_text = ", ".join(edge_providers)
+    if validation_status == "http-similar":
+        return f"Candidate resolves outside known {provider_text} edge ranges and returned similar HTTPS metadata."
+    if validation_status == "http-reachable":
+        return f"Candidate resolves outside known {provider_text} edge ranges and responded to HTTPS HEAD."
+    return f"Candidate hostname pattern resolves outside known {provider_text} edge ranges; manual ownership validation required."
+
+
+def _compare_origin_http_probe(
+    protected_probe: HttpProbe | None,
+    candidate_probe: HttpProbe,
+) -> tuple[str, str]:
+    if candidate_probe.error:
+        return "http-error", candidate_probe.error
+    if candidate_probe.status_code is None:
+        return "not-tested", "No HTTP status returned."
+    if protected_probe is None or protected_probe.status_code is None or protected_probe.error:
+        return "http-reachable", f"{candidate_probe.url} returned HTTP {candidate_probe.status_code}."
+    shared_headers = _shared_http_header_names(protected_probe, candidate_probe)
+    if protected_probe.status_code == candidate_probe.status_code and shared_headers:
+        return (
+            "http-similar",
+            f"Protected and candidate endpoints both returned HTTP {candidate_probe.status_code}; shared headers: {', '.join(shared_headers)}.",
+        )
+    if protected_probe.status_code == candidate_probe.status_code:
+        return (
+            "http-reachable",
+            f"Protected and candidate endpoints both returned HTTP {candidate_probe.status_code}.",
+        )
+    return (
+        "http-reachable",
+        f"{candidate_probe.url} returned HTTP {candidate_probe.status_code}; protected endpoint returned HTTP {protected_probe.status_code}.",
+    )
+
+
+def _shared_http_header_names(left: HttpProbe, right: HttpProbe) -> tuple[str, ...]:
+    left_names = {name for name, _ in left.headers}
+    right_names = {name for name, _ in right.headers}
+    ignored = {"date", "server", "x-cache", "cf-ray", "cf-cache-status"}
+    return tuple(sorted((left_names & right_names) - ignored)[:5])
+
+
+def _is_known_edge_address(value: str, providers: tuple[str, ...]) -> bool:
+    try:
+        addr = ip_address(value)
+    except ValueError:
+        return False
+    for provider in providers:
+        if "Cloudflare" in provider and any(addr in network for network in CLOUDFLARE_NETWORKS):
+            return True
+    return False
 
 
 def brute_force_subdomains(
@@ -899,15 +1313,395 @@ def classify_mail_profile(
 def probe_http(domain: str, timeout: float = 4.0) -> HttpProbe:
     url = f"https://{domain}"
     try:
-        response = httpx.head(url, timeout=timeout, follow_redirects=True)
+        response = httpx.get(url, timeout=timeout, follow_redirects=True)
         interesting = tuple(
             (key.lower(), value)
             for key, value in response.headers.items()
-            if key.lower() in HTTP_HEADER_PROVIDERS or key.lower().startswith(("cf-", "x-"))
+            if key.lower() in HTTP_HEADER_PROVIDERS
+            or key.lower().startswith(("cf-", "x-"))
+            or key.lower()
+            in {
+                "content-security-policy",
+                "content-security-policy-report-only",
+                "report-to",
+                "reporting-endpoints",
+                "location",
+            }
         )
-        return HttpProbe(str(response.url), response.status_code, interesting)
+        return HttpProbe(
+            str(response.url),
+            response.status_code,
+            interesting,
+            title=_html_title(response.text),
+        )
     except httpx.HTTPError as exc:
         return HttpProbe(url, None, (), str(exc))
+
+
+def _csp_origin_records(domain: str, probe: HttpProbe) -> tuple[ReconRecord, ...]:
+    records: list[ReconRecord] = []
+    for header, value in probe.headers:
+        if header not in {
+            "content-security-policy",
+            "content-security-policy-report-only",
+            "report-to",
+            "reporting-endpoints",
+        }:
+            continue
+        ips = tuple(sorted(set(_ip_literals(value))))
+        hostnames = tuple(sorted(set(_hostnames_from_policy(value, domain))))
+        if ips:
+            records.append(
+                ReconRecord(
+                    "https-header",
+                    "csp-ip-leak",
+                    domain,
+                    ", ".join(ips),
+                    "observed",
+                    f"{header} contains IP literals.",
+                )
+            )
+        for hostname in hostnames:
+            records.append(
+                ReconRecord(
+                    "https-header",
+                    "csp-hostname",
+                    hostname,
+                    value[:160],
+                    "observed",
+                    f"{header} references hostname that may be worth DNS validation.",
+                )
+            )
+    return tuple(records)
+
+
+def _tls_certificate_records(domain: str, timeout: float = 4.0) -> tuple[tuple[ReconRecord, ...], tuple[str, ...]]:
+    try:
+        context = ssl.create_default_context()
+        with (
+            socket.create_connection((domain, 443), timeout=timeout) as raw_sock,
+            context.wrap_socket(raw_sock, server_hostname=domain) as tls_sock,
+        ):
+            cert = tls_sock.getpeercert()
+    except (OSError, ssl.SSLError, ValueError):
+        return (), ()
+
+    names: list[str] = []
+    ips: list[str] = []
+    for key, value in cert.get("subjectAltName", ()):
+        normalized = str(value).strip().lower().lstrip("*.").rstrip(".")
+        if not normalized:
+            continue
+        if key.lower() == "dns":
+            names.append(normalized)
+        elif key.lower() == "ip address":
+            ips.append(normalized)
+
+    records: list[ReconRecord] = []
+    if names:
+        records.append(
+            ReconRecord(
+                "tls-certificate",
+                "certificate-san",
+                domain,
+                ", ".join(sorted(set(names))[:50]),
+                "observed",
+                "SubjectAltName DNS entries from the presented certificate.",
+            )
+        )
+    if ips:
+        records.append(
+            ReconRecord(
+                "tls-certificate",
+                "certificate-ip-san",
+                domain,
+                ", ".join(sorted(set(ips))),
+                "observed",
+                "SubjectAltName IP address entries from the presented certificate.",
+            )
+        )
+    return tuple(records), tuple(sorted(set(names)))
+
+
+def _html_title(text: str) -> str | None:
+    match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    title = re.sub(r"\s+", " ", unescape(match.group(1))).strip()
+    return title[:160] or None
+
+
+def _ip_literals(value: str) -> tuple[str, ...]:
+    candidates = re.findall(
+        r"(?<![\w:])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])|(?<![\w:])(?:[a-f0-9]{0,4}:){2,}[a-f0-9]{0,4}(?![\w:])",
+        value,
+        re.IGNORECASE,
+    )
+    return tuple(candidate for candidate in candidates if _is_ip_address(candidate))
+
+
+def _hostnames_from_policy(value: str, domain: str) -> tuple[str, ...]:
+    hosts: list[str] = []
+    for match in re.findall(r"https?://([^/\s;,\"]+)|\b([A-Za-z0-9_.-]+\.[A-Za-z]{2,})\b", value):
+        host = (match[0] or match[1]).split(":", 1)[0].strip().lower().lstrip("*.").rstrip(".")
+        if host and host != domain and host.endswith(f".{domain}"):
+            hosts.append(host)
+    return tuple(hosts)
+
+
+def _is_ip_address(value: str) -> bool:
+    try:
+        ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _address_posture_findings(domain: str, addresses: tuple[DoHAnswer, ...]) -> list[Finding]:
+    findings: list[Finding] = []
+    for answer in addresses:
+        try:
+            address = ip_address(answer.data)
+        except ValueError:
+            continue
+        if address.is_private or address.is_loopback or address.is_link_local or address.is_multicast:
+            findings.append(
+                _finding(
+                    "high",
+                    "Public address hygiene",
+                    "non-public address",
+                    f"{answer.name} returns {answer.data}",
+                    "Public DNS that returns private, loopback, link-local, or multicast addresses can leak internal naming assumptions and break clients outside the private network.",
+                    "Remove the record from public DNS or split-horizon it so only trusted internal resolvers return internal addresses.",
+                    f"dig A {domain} +short and dig AAAA {domain} +short from an external network should not return private or special-use addresses.",
+                )
+            )
+    return findings
+
+
+def _nameserver_posture_findings(domain: str, ns_answers: tuple[DoHAnswer, ...]) -> list[Finding]:
+    if len(ns_answers) == 1:
+        return [
+            _finding(
+                "medium",
+                "Nameserver redundancy",
+                "single nameserver",
+                ns_answers[0].data,
+                "A single authoritative nameserver creates an avoidable DNS availability dependency.",
+                "Publish at least two authoritative nameservers on independent infrastructure where your DNS provider supports it.",
+                f"dig NS {domain} +short should return two or more expected authoritative nameservers.",
+            )
+        ]
+    if len(ns_answers) > 1 and len({_registrable_hint(answer.data) for answer in ns_answers}) == 1:
+        return [
+            _finding(
+                "low",
+                "Nameserver diversity",
+                "same provider suffix",
+                ", ".join(answer.data for answer in ns_answers),
+                "Nameservers appear concentrated under one provider suffix; this is common for managed DNS, but it is still a provider availability dependency.",
+                "Decide whether single-provider managed DNS is acceptable for the domain's availability requirements.",
+                f"dig NS {domain} +short should match the approved DNS architecture and provider inventory.",
+            )
+        ]
+    return []
+
+
+def _soa_posture_findings(domain: str, soa_answers: tuple[DoHAnswer, ...]) -> list[Finding]:
+    findings: list[Finding] = []
+    for soa in soa_answers[:1]:
+        parts = soa.data.split()
+        if len(parts) < 7:
+            continue
+        try:
+            refresh, retry, expire, minimum = (int(parts[index]) for index in (3, 4, 5, 6))
+        except ValueError:
+            continue
+        if expire < 604800:
+            findings.append(
+                _finding(
+                    "low",
+                    "SOA timers",
+                    "short expire",
+                    soa.data,
+                    "Secondary nameservers may stop serving the zone quickly during an upstream outage.",
+                    "Review SOA expire/refresh/retry values against your DNS provider's recommended defaults.",
+                    f"dig SOA {domain} +short should show an expire value appropriate for the zone, commonly at least several days.",
+                )
+            )
+        if minimum > 86400:
+            findings.append(
+                _finding(
+                    "low",
+                    "Negative caching",
+                    "long SOA minimum",
+                    soa.data,
+                    "NXDOMAIN or no-data mistakes can persist at resolvers longer than intended.",
+                    "Lower the SOA minimum/negative TTL if operational rollback speed matters.",
+                    f"dig SOA {domain} +short should show a negative cache TTL aligned with your change process.",
+                )
+            )
+        if retry >= refresh:
+            findings.append(
+                _finding(
+                    "low",
+                    "SOA timers",
+                    "retry not below refresh",
+                    soa.data,
+                    "Secondary nameserver retry behavior may be slower than intended after failed refreshes.",
+                    "Set retry lower than refresh unless the DNS provider manages these values for you.",
+                    f"dig SOA {domain} +short should show retry lower than refresh.",
+                )
+            )
+    return findings
+
+
+def _ttl_posture_findings(domain: str, results: tuple[DoHResult, ...]) -> list[Finding]:
+    findings: list[Finding] = []
+    for result in results:
+        if result.record_type not in {"A", "AAAA", "CNAME", "MX", "NS"} or not result.answers:
+            continue
+        ttl = result.min_ttl
+        if 0 < ttl < 60:
+            findings.append(
+                _finding(
+                    "low",
+                    "TTL",
+                    "very low",
+                    f"{result.record_type} minimum TTL is {ttl}",
+                    "Very low TTLs increase resolver load and can make transient DNS provider issues more visible to clients.",
+                    "Use very low TTLs only during planned migrations; otherwise raise TTLs to an operationally reasonable value.",
+                    f"dig {result.record_type} {domain} +ttlunits should show the intended TTL after propagation.",
+                )
+            )
+        elif ttl > 86400:
+            findings.append(
+                _finding(
+                    "low",
+                    "TTL",
+                    "very high",
+                    f"{result.record_type} minimum TTL is {ttl}",
+                    "Very high TTLs slow incident response and rollback when a record is wrong or a provider migration is needed.",
+                    "Lower TTLs ahead of migrations and keep production TTLs aligned with your rollback expectations.",
+                    f"dig {result.record_type} {domain} +ttlunits should show a TTL that matches the change-management plan.",
+                )
+            )
+    return findings
+
+
+def _caa_posture_findings(domain: str, caa_answers: tuple[DoHAnswer, ...]) -> list[Finding]:
+    values = tuple(answer.data.lower() for answer in caa_answers)
+    findings: list[Finding] = []
+    if not any("issuewild" in value for value in values):
+        findings.append(
+            _finding(
+                "low",
+                "CAA wildcard policy",
+                "not constrained",
+                "CAA records exist, but no issuewild tag was found",
+                "Wildcard certificate issuance may be less explicit than intended.",
+                "Add issuewild records that either authorize the expected CA or deny wildcard issuance with issuewild ';'.",
+                f"dig CAA {domain} +short should show an intentional issuewild policy.",
+            )
+        )
+    if any("iodef" in value and "mailto:" not in value and "https:" not in value for value in values):
+        findings.append(
+            _finding(
+                "low",
+                "CAA reporting",
+                "unusual iodef",
+                "; ".join(values),
+                "CAA incident reporting may not reach a monitored destination.",
+                "Use mailto: or https: iodef destinations that route to a monitored security mailbox or endpoint.",
+                f"dig CAA {domain} +short should show monitored iodef destinations if CAA reporting is used.",
+            )
+        )
+    return findings
+
+
+def _spf_posture_findings(domain: str, spf_values: tuple[str, ...]) -> list[Finding]:
+    findings: list[Finding] = []
+    for value in spf_values:
+        normalized = f" {_clean_txt(value).lower()} "
+        if not any(term in normalized for term in (" -all ", " ~all ", " ?all ", " +all ")):
+            findings.append(
+                _finding(
+                    "medium",
+                    "SPF",
+                    "missing all mechanism",
+                    value,
+                    "Receivers may treat the SPF policy as neutral or malformed, reducing sender authorization value.",
+                    "End the SPF record with an intentional all mechanism, usually -all after all legitimate senders are authorized.",
+                    f"dig TXT {domain} +short | grep -i 'v=spf1' should show exactly one SPF record with an all mechanism.",
+                )
+            )
+        if " ?all " in normalized:
+            findings.append(
+                _finding(
+                    "low",
+                    "SPF",
+                    "neutral all",
+                    value,
+                    "?all tells receivers to make no SPF authorization decision for non-matching senders.",
+                    "Use ~all during transition or -all once legitimate sources are known.",
+                    f"dig TXT {domain} +short | grep -i 'v=spf1' should not end with ?all unless that is intentional.",
+                )
+            )
+        lookup_count = _spf_dns_lookup_count(value)
+        if lookup_count > 10:
+            findings.append(
+                _finding(
+                    "high",
+                    "SPF",
+                    "too many DNS lookups",
+                    f"{lookup_count} estimated lookup mechanisms in {value}",
+                    "SPF evaluation can return permerror when the DNS lookup limit is exceeded, causing legitimate mail failures and weaker anti-spoofing.",
+                    "Flatten or reduce include/a/mx/ptr/exists/redirect mechanisms until the SPF policy stays under the 10 lookup limit.",
+                    f"Use a dedicated SPF checker or expand includes to confirm {domain}'s SPF record stays within the 10 lookup limit.",
+                )
+            )
+        if len(value) > 255:
+            findings.append(
+                _finding(
+                    "medium",
+                    "SPF",
+                    "long TXT segment risk",
+                    f"{len(value)} characters",
+                    "Long SPF records are often split incorrectly by DNS control panels, which can break SPF parsing.",
+                    "Confirm TXT string segmentation in the authoritative DNS provider or reduce the SPF record length.",
+                    f"dig TXT {domain} +short should return one syntactically valid SPF record as interpreted by receivers.",
+                )
+            )
+    return findings
+
+
+def _spf_dns_lookup_count(value: str) -> int:
+    count = 0
+    for token in _clean_txt(value).lower().split():
+        mechanism = token.lstrip("+-~?")
+        if mechanism in {"a", "mx", "ptr"} or mechanism.startswith(("include:", "a:", "mx:", "exists:", "redirect=")):
+            count += 1
+    return count
+
+
+def _dmarc_pct(value: str) -> int | None:
+    for part in value.split(";"):
+        key, _, raw_value = part.strip().partition("=")
+        if key == "pct":
+            try:
+                return int(raw_value.strip().strip('"'))
+            except ValueError:
+                return None
+    return None
+
+
+def _registrable_hint(name: str) -> str:
+    labels = name.rstrip(".").lower().split(".")
+    return ".".join(labels[-2:]) if len(labels) >= 2 else name.rstrip(".").lower()
+
+
+def _clean_txt(value: str) -> str:
+    return value.strip().strip('"')
 
 
 def _mail_recommendation(mail_profile: MailProfile, recommendation: str) -> str:
@@ -1002,7 +1796,15 @@ def _append_plain_recon(lines: list[str], inspection: Inspection) -> None:
     if inspection.origin_candidates:
         lines.append(";; passive origin exposure candidates")
         for candidate in inspection.origin_candidates:
-            lines.append(f";;   {candidate.hostname}: {', '.join(candidate.addresses)} [{candidate.confidence}]")
+            validation = (
+                f"; validation={candidate.validation_status} ({candidate.validation_evidence})"
+                if candidate.validation_evidence
+                else f"; validation={candidate.validation_status}"
+            )
+            lines.append(
+                f";;   {candidate.hostname}: {', '.join(candidate.addresses)} "
+                f"[{candidate.confidence}; provider={candidate.edge_provider or '-'}{validation}]"
+            )
         lines.append("")
     if inspection.zone_transfer_records:
         lines.append(";; zone transfer")
@@ -1144,6 +1946,22 @@ def _external_osint_sources(domain: str) -> tuple[ReconRecord, ...]:
             "reference",
             "Manual OSINT pivot for hosting and certificate observations.",
         ),
+        ReconRecord(
+            "Censys",
+            "external-osint",
+            domain,
+            f"https://search.censys.io/search?resource=hosts&q={quote_plus(domain)}",
+            "reference",
+            "Manual host/certificate/header pivot for authorized origin exposure review.",
+        ),
+        ReconRecord(
+            "URLScan",
+            "external-osint",
+            domain,
+            f"https://urlscan.io/search/#{quote_plus(f'domain:{domain}')}",
+            "reference",
+            "Manual URLScan pivot for page titles, requests, CSP, and related hostnames.",
+        ),
     )
 
 
@@ -1200,6 +2018,16 @@ def _detect_http_headers(probe: HttpProbe, detections: dict[tuple[str, str], Det
                 provider = "Cloudflare"
             elif "akamai" in lower_value:
                 provider = "Akamai"
+            elif "cloudfront" in lower_value:
+                provider = "AWS CloudFront"
+            elif "fastly" in lower_value:
+                provider = "Fastly"
+            elif "bunny" in lower_value:
+                provider = "Bunny"
+            elif "gcore" in lower_value:
+                provider = "Gcore"
+            elif "imperva" in lower_value or "incapsula" in lower_value:
+                provider = "Imperva"
             elif "google" in lower_value:
                 provider = "Google"
             else:
