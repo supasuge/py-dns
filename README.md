@@ -1,5 +1,7 @@
 # py-dns
 
+https://supasuge.github.io/
+
 `py-dns` is a Python DNS security and enumeration tool with two operating surfaces:
 
 - a secure local DNS resolver that uses a cache, `/etc/hosts`, DNS-over-HTTPS, and DNS-over-TLS;
