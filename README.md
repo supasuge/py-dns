@@ -1,6 +1,6 @@
 # py-dns
 
-https://supasuge.github.io/
+[Try it live here!](https://supasuge.github.io/py-dns/)
 
 `py-dns` is a Python DNS security and enumeration tool with two operating surfaces:
 
